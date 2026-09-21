@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Doily</title>
+  <meta name="description" content="A cosy place to keep track of how you feel.">
+  <meta name="theme-color" content="#fffcf1">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn" id="prevDay" aria-label="Previous day">‹</button>
+    <div class="topbar-title">
+      <div class="brand"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="10" stroke-dasharray="1 2.6"/><circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2.2" fill="#5e8b47" stroke="none"/></svg>doily</div>
+      <button class="date-btn" id="dateLabel" aria-label="Pick a date"></button>
+      <input type="date" id="datePicker" class="visually-hidden" aria-hidden="true">
+    </div>
+    <button class="icon-btn" id="nextDay" aria-label="Next day">›</button>
+  </header>
+
+  <main id="view" class="view"></main>
+
+  <nav class="tabbar" aria-label="Main">
+    <button data-tab="log" class="tab active"><span class="tab-ico">✎</span>Log</button>
+    <button data-tab="calendar" class="tab"><span class="tab-ico">▦</span>Calendar</button>
+    <button data-tab="patterns" class="tab"><span class="tab-ico">❋</span>Patterns</button>
+    <button data-tab="history" class="tab"><span class="tab-ico">☰</span>History</button>
+    <button data-tab="settings" class="tab"><span class="tab-ico">⚙</span>Settings</button>
+  </nav>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
