@@ -30,6 +30,10 @@ Then open http://localhost:8080 in Chrome. To test on a phone on the same Wi-Fi,
 
 ## Put it online for free
 
+The live copy is at **https://ievonzas.github.io/doily/**. Open it in Chrome on Android and choose **Add to Home screen**.
+
+To host your own copy:
+
 1. Create a GitHub repository and push this folder.
 2. In the repository settings, turn on **Pages** for the main branch, root folder.
 3. Open the Pages URL in Chrome on Android, then choose **Add to Home screen** from the menu.

@@ -79,6 +79,10 @@ localStorage keys: `doily.entries.v1`, `doily.settings.v1`, `doily.weather.v1`, 
 
 Service worker cache name is `doily-v2` in sw.js. Bump it whenever style.css, index.html or app.js change, otherwise installed phones keep serving the old shell.
 
+## Deployment
+
+GitHub repo `ievonzas/doily`, GitHub Pages from `main` branch root, live at https://ievonzas.github.io/doily/ (first deployed 2026-09-21). Pushing to `main` redeploys within a minute or two. Bump the service worker cache name in sw.js with every push that changes the shell, or installed phones keep the old version.
+
 ## Running and testing
 
 ```
