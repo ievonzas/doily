@@ -29,7 +29,7 @@
   let entries = load(ENTRIES_KEY, {});
   let settings = Object.assign({
     lat: null, lon: null, place: '', cycleLength: 28, periodLength: 5,
-    customSymptoms: [], customPainAreas: [], docLang: 'lt'
+    customSymptoms: [], customPainAreas: [], docLang: 'lt', docStyle: 'conv'
   }, load(SETTINGS_KEY, {}));
   let currentDate = todayKey();
   let tab = 'log';
@@ -218,12 +218,106 @@
     }
   }
 
-  // ---------- records: test results, medicine/supplement courses, notes ----------
+  // ---------- records: test results, medicine/supplement courses, conditions, notes ----------
   // { id, type:'test', name, date, value, unit, low, high, notes }
-  // { id, type:'course', name, start, end|null, notes }   end null = still taking
+  // { id, type:'course', name, start, end|null, notes }      end null = still taking
+  // { id, type:'condition', name, start, end|null, notes }   illness, diagnosis or operation; start/end may be a bare year or year-month
   // { id, type:'note', name, date, notes }
   function courseActive(r, k) { return r.type === 'course' && r.start <= k && (!r.end || k <= r.end); }
+  // a condition counts as a daily factor only when it started on a known full date during the diary
+  function conditionActive(r, k) { return r.type === 'condition' && r.start.length === 10 && r.start <= k && (!r.end || k <= (r.end.length === 10 ? r.end : r.end + '-12-31')); }
   function fmtShort(k) { return parseKey(k).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }); }
+  // conditions may have a partial date: "2019", "2021-03" or a full day
+  function fmtWhen(k) { return !k ? '' : k.length === 10 ? fmtShort(k) : k.length === 7 ? parseKey(k + '-01').toLocaleDateString(undefined, { month: 'short', year: 'numeric' }) : k; }
+  function normWhen(v) {
+    v = v.trim().replace(/[./]/g, '-');
+    const m = v.match(/^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?$/);
+    if (!m) return null;
+    return m[1] + (m[2] ? '-' + pad(m[2]) : '') + (m[3] ? '-' + pad(m[3]) : '');
+  }
+
+  // ---------- scan: read a result sheet from a photo or pasted text ----------
+  // OCR runs on the phone with Tesseract (WebAssembly). The photo never leaves the device; only the
+  // engine and the Lithuanian + English language data are downloaded, keyless, from the jsDelivr CDN
+  // the first time (about 10 MB, then cached). Whatever is read is shown as editable rows to confirm.
+  const OCR_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js';
+  let tessPromise = null;
+  function loadTesseract() {
+    if (window.Tesseract) return Promise.resolve(window.Tesseract);
+    if (!tessPromise) tessPromise = new Promise((res, rej) => {
+      const sc = document.createElement('script'); sc.src = OCR_SRC;
+      sc.onload = () => res(window.Tesseract);
+      sc.onerror = () => { tessPromise = null; rej(new Error('Could not download the reader')); };
+      document.head.appendChild(sc);
+    });
+    return tessPromise;
+  }
+  async function fileToCanvas(file) {
+    let img;
+    if (window.createImageBitmap) { try { img = await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch { } }
+    if (!img) {
+      const url = URL.createObjectURL(file);
+      try { img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; }); }
+      finally { URL.revokeObjectURL(url); }
+    }
+    const w = img.width || img.naturalWidth, h = img.height || img.naturalHeight;
+    const scale = Math.min(1, 2200 / Math.max(w, h)); // phone photos are huge; this is plenty for print
+    const c = document.createElement('canvas'); c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+    const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, c.width, c.height);
+    const id = ctx.getImageData(0, 0, c.width, c.height), d = id.data; // grey with a little extra contrast helps printed sheets
+    for (let i = 0; i < d.length; i += 4) { const g = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] - 128) * 1.25 + 128; d[i] = d[i + 1] = d[i + 2] = g < 0 ? 0 : g > 255 ? 255 : g; }
+    ctx.putImageData(id, 0, 0);
+    return c;
+  }
+  async function ocrFile(file, onProgress) {
+    onProgress('Loading the reader…');
+    const T = await loadTesseract();
+    const canvas = await fileToCanvas(file);
+    const worker = await T.createWorker('lit+eng', 1, { logger: m => { if (m.status === 'recognizing text') onProgress(`Reading… ${Math.round(m.progress * 100)}%`); } });
+    try { const { data } = await worker.recognize(canvas, { rotateAuto: true }); return data.text; }
+    finally { worker.terminate(); }
+  }
+  // Turns the text of a result sheet into rows { name, value, unit, low, high }.
+  // One row per line that has a name and a number; the range is "13 - 150", "< 5" or "> 30".
+  // Returns { date, rows }. The date is the first plausible recent date on the sheet, if any.
+  const NUM = '\\d+(?:\\.\\d+)?';
+  const STANDALONE = new RegExp(`(?<![A-Za-z\\d.^µμ])(${NUM})(?!\\d|\\.\\d|\\^|-[A-Za-z]|\\s*(?:OH|\\)))`, 'g');
+  function parseResultSheet(text) {
+    const rows = []; let date = null;
+    const t = todayKey(), floor = addDays(t, -730);
+    for (const raw of String(text).split(/\r?\n/)) {
+      let line = raw.replace(/[‐-―−]/g, '-').replace(/[|_]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!line) continue;
+      // dates: 2026-10-15 (Lithuanian sheets) or 15.10.2026 / 15/10/2026
+      for (const m of line.matchAll(/(\d{4})-(\d{2})-(\d{2})|(\d{1,2})[./](\d{1,2})[./](\d{4})/g)) {
+        const k = m[1] ? `${m[1]}-${m[2]}-${m[3]}` : `${m[6]}-${pad(m[5])}-${pad(m[4])}`;
+        if (!date && k <= t && k >= floor && !isNaN(parseKey(k))) date = k; // skips birth dates and nonsense
+      }
+      line = line.replace(/\d{4}-\d{2}-\d{2}(\s*\d{1,2}:\d{2}(:\d{2})?)?/g, ' ').replace(/\d{1,2}[./]\d{1,2}[./]\d{4}/g, ' ').replace(/(\d),(\d)/g, '$1.$2');
+      let low = null, high = null, rStart = -1, rEnd = -1;
+      const rm = line.match(new RegExp(`(?<![\\w.])(${NUM}) ?- ?(${NUM})(?![\\w.])`));
+      if (rm) { low = rm[1]; high = rm[2]; rStart = rm.index; rEnd = rm.index + rm[0].length; }
+      else {
+        const lt = line.match(new RegExp(`(?:<=?|≤) ?(${NUM})`)), gt = line.match(new RegExp(`(?:>=?|≥) ?(${NUM})`));
+        if (lt) { high = lt[1]; rStart = lt.index; rEnd = lt.index + lt[0].length; }
+        else if (gt) { low = gt[1]; rStart = gt.index; rEnd = gt.index + gt[0].length; }
+      }
+      const nums = [...line.matchAll(STANDALONE)].filter(m => rStart < 0 || m.index < rStart || m.index >= rEnd);
+      if (!nums.length) continue;
+      const vm = nums[0]; // the result is the first free-standing number; names keep theirs attached (B12, 25-OH, HbA1c)
+      const value = ('<>'.includes(line[vm.index - 1] || '') ? line[vm.index - 1] : '') + vm[1], vEnd = vm.index + vm[0].length;
+      let name = line.slice(0, vm.index).replace(/^\s*(\d+[.)]|[-*•·])\s*/, '').replace(/[\s:;,.*#<>≤≥=-]+$/, '').trim();
+      if (!/[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūžА-Яа-яЁё]{2,}/.test(name) || name.length > 60) continue;
+      // unit: first token after the value that looks like one, skipping H/L flags
+      const after = line.slice(vEnd, rStart >= 0 && rStart > vEnd ? rStart : undefined).trim().split(' ').filter(Boolean);
+      let unit = '';
+      for (const tok of after) { if (/^[HLNA*↑↓]$/.test(tok)) continue; if (/^[A-Za-zµμ%0-9^][A-Za-zµμ%0-9^/*.·-]*$/.test(tok) && /[A-Za-zµμ%^]/.test(tok) && tok.length <= 10) unit = tok; break; }
+      if (!unit && low == null && high == null && !value.includes('.')) continue; // a bare integer with no unit or range is usually not a result
+      rows.push({ name, value, unit, low, high });
+    }
+    return { date, rows };
+  }
+  let scan = { rows: null, date: null, raw: '', status: '', pasteOpen: false };
 
   // ---------- patterns: rule-based, offline, her own logs only ----------
   function loggedDays() { return Object.keys(entries).filter(k => hasContent(entries[k])).sort(); }
@@ -250,6 +344,7 @@
     if (kind === 'food') return `within a day of having ${v}`;
     if (kind === 'med') return `within a day of taking ${v}`;
     if (kind === 'course') { const r = records.find(x => x.id === v); return `while on ${r ? r.name : 'a course'}`; }
+    if (kind === 'cond') { const r = records.find(x => x.id === v); return `while ${r ? r.name : 'ill'}`; }
     return f;
   }
   function dayFactors(k) {
@@ -273,7 +368,7 @@
     for (const x of e.foods) f.add('food:' + x);
     for (const x of e.meds) f.add('med:' + x);
     if (y) { for (const x of y.foods) f.add('food:' + x); for (const x of y.meds) f.add('med:' + x); }
-    for (const r of records) if (courseActive(r, k)) f.add('course:' + r.id);
+    for (const r of records) { if (courseActive(r, k)) f.add('course:' + r.id); if (conditionActive(r, k)) f.add('cond:' + r.id); }
     return f;
   }
   // Returns { days, findings: [{ symptom, factor, label, hitsW, nW, hitsO, nO, more }] }
@@ -379,6 +474,7 @@
       symptoms: 'Symptoms, last 90 days', symLine: '{sym}: {hits} of {n} logged days ({pct}%)', painLine: 'Pain, {area}: {hits} days, average intensity {avg}/10', none: 'none logged',
       meds: 'Medicines and supplements logged, last 90 days', medLine: '{name}: {n} days',
       courses: 'Courses (medicines or supplements taken over a period)', courseLine: '{name}: from {start} to {end}', courseOngoing: '{name}: since {start}, still taking',
+      conditions: 'Conditions, diagnoses and operations (as stated by the patient)', condLine: '{name}: {start} to {end}', condOngoing: '{name}: since {start}, ongoing',
       tests: 'Test results (typed in by the patient from the result sheet)', testLine: '{date}: {name} {value} {unit}', range: 'reference range {low}–{high}', below: 'BELOW RANGE', above: 'ABOVE RANGE',
       notes: 'Notes', patterns: 'Patterns in the diary (correlations, not causes)',
       more: '{sym}: more often {label}. On {hitsW} of {nW} days, compared with {hitsO} of {nO} other days.',
@@ -386,8 +482,20 @@
       noPatterns: 'Not enough days logged yet for patterns.',
       footer: 'Generated by Doily, a personal diary app. These are correlations in self-reported logs, not a diagnosis.',
       flows: { none: 'none', spotting: 'spotting', light: 'light', medium: 'medium', heavy: 'heavy' },
-      factors: { pdrop: 'when air pressure fell 4 hPa or more since the day before', prise: 'when air pressure rose 4 hPa or more since the day before', pswing: 'on days the pressure swung 8 hPa or more', plow: 'on low-pressure days (1000 hPa or under)', shortsleep: 'after a night of under 6 hours of sleep', fullmoon: 'around the full moon', newmoon: 'around the new moon', menses: 'on period days', premens: 'in the 5 days before a period', ovul: 'around ovulation', food: 'within a day of having: {x}', med: 'within a day of taking: {x}', course: 'while on the course: {x}' },
-      sym: {}, area: {}, painName: 'Pain: {area}'
+      factors: { pdrop: 'when air pressure fell 4 hPa or more since the day before', prise: 'when air pressure rose 4 hPa or more since the day before', pswing: 'on days the pressure swung 8 hPa or more', plow: 'on low-pressure days (1000 hPa or under)', shortsleep: 'after a night of under 6 hours of sleep', fullmoon: 'around the full moon', newmoon: 'around the new moon', menses: 'on period days', premens: 'in the 5 days before a period', ovul: 'around ovulation', food: 'within a day of having: {x}', med: 'within a day of taking: {x}', course: 'while on the course: {x}', cond: 'during: {x}' },
+      sym: {}, area: {}, painName: 'Pain: {area}',
+      fmTitle: 'Health diary summary, functional medicine format (Doily)',
+      fmIntro: 'The same diary data arranged the way a functional medicine practitioner reads a case: timeline, body systems, lifestyle factors, possible triggers. The grouping is done by the app from symptom names and is approximate.',
+      timeline: 'Timeline (conditions, events, courses and tests in date order)', tlCond: '{start}: {name}, ongoing', tlCondEnded: '{start}: {name}, until {end}', tlNote: '{date}: {name}',
+      tlCourseStart: '{start}: started {name}, still taking', tlCourse: '{start}: {name}, until {end}', tlTest: '{date}: test, {name} {value} {unit}', noRecords: 'No records entered yet.',
+      systems: 'Symptoms by body system, last 90 days (approximate grouping by the app, after the IFM matrix)',
+      nodes: { assim: 'Assimilation (digestion)', energy: 'Energy and sleep', comm: 'Communication (hormones, mood)', defense: 'Defence and repair (skin, immune, swelling)', structure: 'Structural integrity (pain, musculoskeletal)', other: 'Other, not grouped' },
+      hormonal: 'Hormonal rhythm (menstrual cycle)', noCycleFindings: 'No symptom clearly tracked the cycle in the diary so far.',
+      lifestyle: 'Modifiable lifestyle factors', sleepLine: 'Sleep: average {avg} h over {n} logged nights, {short} nights under 6 h.', sleepNone: 'Sleep: not logged.',
+      foodsLine: 'Food and drink logged most often: {list}.', foodsNone: 'Food and drink: not logged.', medsFm: 'Medicines and supplements logged most often: {list}.', countItem: '{name} ({n} days)',
+      triggers: 'Possible triggers and mediators in the diary (correlations, not causes)',
+      trigGroups: { food: 'Food and drink', med: 'Medicines, supplements and courses', env: 'Air pressure, weather and moon', sleep: 'Sleep', cond: 'Illness periods' }, noTriggers: 'Nothing stood out yet.',
+      labs: 'Lab results (typed by the patient from the result sheet; only the ranges printed by the lab are used, no "optimal" ranges)'
     },
     lt: {
       title: 'Sveikatos dienoraščio santrauka (Doily)',
@@ -396,6 +504,7 @@
       symptoms: 'Simptomai per paskutines 90 dienų', symLine: '{sym}: {hits} iš {n} užpildytų dienų ({pct} %)', painLine: 'Skausmas, {area}: {hits} d., vidutinis stiprumas {avg}/10', none: 'neužfiksuota',
       meds: 'Vartoti vaistai ir papildai per paskutines 90 dienų', medLine: '{name}: {n} d.',
       courses: 'Kursai (vaistai ar papildai, vartoti tam tikrą laikotarpį)', courseLine: '{name}: nuo {start} iki {end}', courseOngoing: '{name}: nuo {start}, tebevartoja',
+      conditions: 'Ligos, diagnozės ir operacijos (pacientės nurodymu)', condLine: '{name}: nuo {start} iki {end}', condOngoing: '{name}: nuo {start}, tebesitęsia',
       tests: 'Tyrimų rezultatai (pacientės įvesti iš atsakymo lapo)', testLine: '{date}: {name} {value} {unit}', range: 'referencinės ribos {low}–{high}', below: 'ŽEMIAU RIBOS', above: 'AUKŠČIAU RIBOS',
       notes: 'Pastabos', patterns: 'Dėsningumai dienoraštyje (sąsajos, ne priežastys)',
       more: '{sym}: dažniau {label}. {hitsW} iš {nW} dienų, palyginti su {hitsO} iš {nO} kitų dienų.',
@@ -403,10 +512,22 @@
       noPatterns: 'Dėsningumams dar per mažai užpildytų dienų.',
       footer: 'Sudaryta programėle „Doily“ (asmeninis dienoraštis). Tai tik sąsajos pačios pacientės įrašuose, ne diagnozė.',
       flows: { none: 'nėra', spotting: 'tepimas', light: 'negausios', medium: 'vidutinės', heavy: 'gausios' },
-      factors: { pdrop: 'kai oro slėgis nukrito 4 hPa ar daugiau nuo praėjusios dienos', prise: 'kai oro slėgis pakilo 4 hPa ar daugiau nuo praėjusios dienos', pswing: 'dienomis, kai slėgis svyravo 8 hPa ar daugiau', plow: 'žemo slėgio dienomis (1000 hPa ar mažiau)', shortsleep: 'po trumpesnio nei 6 val. miego', fullmoon: 'apie pilnatį', newmoon: 'apie jaunatį', menses: 'mėnesinių dienomis', premens: '5 dienas prieš mėnesines', ovul: 'apie ovuliaciją', food: 'per parą po to, kai vartojo: {x}', med: 'per parą po to, kai vartojo: {x}', course: 'vartojant kursą: {x}' },
+      factors: { pdrop: 'kai oro slėgis nukrito 4 hPa ar daugiau nuo praėjusios dienos', prise: 'kai oro slėgis pakilo 4 hPa ar daugiau nuo praėjusios dienos', pswing: 'dienomis, kai slėgis svyravo 8 hPa ar daugiau', plow: 'žemo slėgio dienomis (1000 hPa ar mažiau)', shortsleep: 'po trumpesnio nei 6 val. miego', fullmoon: 'apie pilnatį', newmoon: 'apie jaunatį', menses: 'mėnesinių dienomis', premens: '5 dienas prieš mėnesines', ovul: 'apie ovuliaciją', food: 'per parą po to, kai vartojo: {x}', med: 'per parą po to, kai vartojo: {x}', course: 'vartojant kursą: {x}', cond: 'sergant: {x}' },
       sym: { 'Headache': 'Galvos skausmas', 'Migraine': 'Migrena', 'Fatigue': 'Nuovargis', 'Nausea': 'Pykinimas', 'Bloating': 'Pilvo pūtimas', 'Cramps': 'Spazmai', 'Rash': 'Bėrimas', 'Itching': 'Niežėjimas', 'Dizziness': 'Galvos svaigimas', 'Low mood': 'Prasta nuotaika', 'Anxious': 'Nerimas', 'Irritable': 'Dirglumas', 'Brain fog': 'Sunku susikaupti', 'Acne': 'Spuogai', 'Sore breasts': 'Skausmingos krūtys', 'Constipation': 'Vidurių užkietėjimas', 'Diarrhoea': 'Viduriavimas', 'Hot flush': 'Karščio pylimas', 'Swelling': 'Tinimas', 'Poor sleep': 'Prastas miegas' },
       area: { 'Head': 'galva', 'Neck': 'kaklas', 'Shoulders': 'pečiai', 'Back': 'nugara', 'Belly': 'pilvas', 'Pelvis': 'dubuo', 'Joints': 'sąnariai', 'Legs': 'kojos', 'Chest': 'krūtinė', 'Other': 'kita' },
-      painName: 'Skausmas: {area}'
+      painName: 'Skausmas: {area}',
+      fmTitle: 'Sveikatos dienoraščio santrauka funkcinės medicinos formatu (Doily)',
+      fmIntro: 'Tie patys dienoraščio duomenys sudėlioti taip, kaip atvejį skaito funkcinės medicinos specialistas: laiko juosta, organizmo sistemos, gyvensenos veiksniai, galimi dirgikliai. Grupavimą pagal simptomų pavadinimus atlieka programėlė, jis apytikslis.',
+      timeline: 'Laiko juosta (ligos, įvykiai, kursai ir tyrimai pagal datą)', tlCond: '{start}: {name}, tebesitęsia', tlCondEnded: '{start}: {name}, iki {end}', tlNote: '{date}: {name}',
+      tlCourseStart: '{start}: pradėta vartoti {name}, tebevartoja', tlCourse: '{start}: {name}, iki {end}', tlTest: '{date}: tyrimas, {name} {value} {unit}', noRecords: 'Įrašų dar nėra.',
+      systems: 'Simptomai pagal organizmo sistemas, paskutinės 90 dienų (apytikslis programėlės grupavimas pagal IFM matricą)',
+      nodes: { assim: 'Įsisavinimas (virškinimas)', energy: 'Energija ir miegas', comm: 'Komunikacija (hormonai, nuotaika)', defense: 'Apsauga ir atsistatymas (oda, imunitetas, tinimas)', structure: 'Struktūrinis vientisumas (skausmas, raumenys ir sąnariai)', other: 'Kita, nesugrupuota' },
+      hormonal: 'Hormoninis ritmas (menstruacinis ciklas)', noCycleFindings: 'Kol kas nė vienas simptomas aiškiai nesusijęs su ciklu.',
+      lifestyle: 'Keičiami gyvensenos veiksniai', sleepLine: 'Miegas: vidutiniškai {avg} val. per {n} užfiksuotų naktų, {short} naktys trumpesnės nei 6 val.', sleepNone: 'Miegas: neužfiksuota.',
+      foodsLine: 'Dažniausiai žymėtas maistas ir gėrimai: {list}.', foodsNone: 'Maistas ir gėrimai: neužfiksuota.', medsFm: 'Dažniausiai žymėti vaistai ir papildai: {list}.', countItem: '{name} ({n} d.)',
+      triggers: 'Galimi dirgikliai ir tarpininkai dienoraštyje (sąsajos, ne priežastys)',
+      trigGroups: { food: 'Maistas ir gėrimai', med: 'Vaistai, papildai ir kursai', env: 'Oro slėgis, orai ir mėnulis', sleep: 'Miegas', cond: 'Ligos laikotarpiai' }, noTriggers: 'Kol kas niekas neišsiskyrė.',
+      labs: 'Tyrimų rezultatai (pacientės įvesti iš atsakymo lapo; naudojamos tik laboratorijos nurodytos ribos, ne „optimalios“)'
     },
     ru: {
       title: 'Сводка дневника здоровья (Doily)',
@@ -415,6 +536,7 @@
       symptoms: 'Симптомы за последние 90 дней', symLine: '{sym}: {hits} из {n} заполненных дней ({pct} %)', painLine: 'Боль, {area}: {hits} дн., средняя интенсивность {avg}/10', none: 'не отмечено',
       meds: 'Принимаемые лекарства и добавки за последние 90 дней', medLine: '{name}: {n} дн.',
       courses: 'Курсы (лекарства или добавки, принимаемые в течение периода)', courseLine: '{name}: с {start} по {end}', courseOngoing: '{name}: с {start}, продолжает принимать',
+      conditions: 'Заболевания, диагнозы и операции (со слов пациентки)', condLine: '{name}: с {start} по {end}', condOngoing: '{name}: с {start}, продолжается',
       tests: 'Результаты анализов (введены пациенткой с бланка результата)', testLine: '{date}: {name} {value} {unit}', range: 'референсный диапазон {low}–{high}', below: 'НИЖЕ НОРМЫ', above: 'ВЫШЕ НОРМЫ',
       notes: 'Заметки', patterns: 'Закономерности в дневнике (корреляции, не причины)',
       more: '{sym}: чаще {label}. В {hitsW} из {nW} дней, по сравнению с {hitsO} из {nO} остальных дней.',
@@ -422,10 +544,22 @@
       noPatterns: 'Пока недостаточно заполненных дней для закономерностей.',
       footer: 'Составлено приложением Doily (личный дневник). Это только корреляции в записях самой пациентки, не диагноз.',
       flows: { none: 'нет', spotting: 'мажущие', light: 'скудные', medium: 'умеренные', heavy: 'обильные' },
-      factors: { pdrop: 'когда атмосферное давление упало на 4 гПа или больше по сравнению с предыдущим днём', prise: 'когда атмосферное давление выросло на 4 гПа или больше по сравнению с предыдущим днём', pswing: 'в дни, когда давление колебалось на 8 гПа или больше', plow: 'в дни низкого давления (1000 гПа и ниже)', shortsleep: 'после ночи со сном меньше 6 часов', fullmoon: 'около полнолуния', newmoon: 'около новолуния', menses: 'в дни менструации', premens: 'за 5 дней до менструации', ovul: 'около овуляции', food: 'в течение суток после употребления: {x}', med: 'в течение суток после приёма: {x}', course: 'во время курса: {x}' },
+      factors: { pdrop: 'когда атмосферное давление упало на 4 гПа или больше по сравнению с предыдущим днём', prise: 'когда атмосферное давление выросло на 4 гПа или больше по сравнению с предыдущим днём', pswing: 'в дни, когда давление колебалось на 8 гПа или больше', plow: 'в дни низкого давления (1000 гПа и ниже)', shortsleep: 'после ночи со сном меньше 6 часов', fullmoon: 'около полнолуния', newmoon: 'около новолуния', menses: 'в дни менструации', premens: 'за 5 дней до менструации', ovul: 'около овуляции', food: 'в течение суток после употребления: {x}', med: 'в течение суток после приёма: {x}', course: 'во время курса: {x}', cond: 'во время: {x}' },
       sym: { 'Headache': 'Головная боль', 'Migraine': 'Мигрень', 'Fatigue': 'Усталость', 'Nausea': 'Тошнота', 'Bloating': 'Вздутие живота', 'Cramps': 'Спазмы', 'Rash': 'Сыпь', 'Itching': 'Зуд', 'Dizziness': 'Головокружение', 'Low mood': 'Подавленное настроение', 'Anxious': 'Тревожность', 'Irritable': 'Раздражительность', 'Brain fog': 'Туман в голове', 'Acne': 'Акне', 'Sore breasts': 'Болезненность груди', 'Constipation': 'Запор', 'Diarrhoea': 'Диарея', 'Hot flush': 'Приливы жара', 'Swelling': 'Отёки', 'Poor sleep': 'Плохой сон' },
       area: { 'Head': 'голова', 'Neck': 'шея', 'Shoulders': 'плечи', 'Back': 'спина', 'Belly': 'живот', 'Pelvis': 'таз', 'Joints': 'суставы', 'Legs': 'ноги', 'Chest': 'грудь', 'Other': 'другое' },
-      painName: 'Боль: {area}'
+      painName: 'Боль: {area}',
+      fmTitle: 'Сводка дневника здоровья в формате функциональной медицины (Doily)',
+      fmIntro: 'Те же данные дневника, расположенные так, как случай читает специалист по функциональной медицине: хронология, системы организма, факторы образа жизни, возможные триггеры. Группировка выполнена приложением по названиям симптомов и приблизительна.',
+      timeline: 'Хронология (заболевания, события, курсы и анализы по датам)', tlCond: '{start}: {name}, продолжается', tlCondEnded: '{start}: {name}, до {end}', tlNote: '{date}: {name}',
+      tlCourseStart: '{start}: начат приём {name}, продолжает принимать', tlCourse: '{start}: {name}, до {end}', tlTest: '{date}: анализ, {name} {value} {unit}', noRecords: 'Записей пока нет.',
+      systems: 'Симптомы по системам организма, последние 90 дней (приблизительная группировка приложением по матрице IFM)',
+      nodes: { assim: 'Усвоение (пищеварение)', energy: 'Энергия и сон', comm: 'Коммуникация (гормоны, настроение)', defense: 'Защита и восстановление (кожа, иммунитет, отёки)', structure: 'Структурная целостность (боль, опорно-двигательный аппарат)', other: 'Прочее, без группы' },
+      hormonal: 'Гормональный ритм (менструальный цикл)', noCycleFindings: 'Пока ни один симптом явно не связан с циклом.',
+      lifestyle: 'Изменяемые факторы образа жизни', sleepLine: 'Сон: в среднем {avg} ч за {n} отмеченных ночей, {short} ночей короче 6 ч.', sleepNone: 'Сон: не отмечен.',
+      foodsLine: 'Чаще всего отмеченные еда и напитки: {list}.', foodsNone: 'Еда и напитки: не отмечены.', medsFm: 'Чаще всего отмеченные лекарства и добавки: {list}.', countItem: '{name} ({n} дн.)',
+      triggers: 'Возможные триггеры и медиаторы в дневнике (корреляции, не причины)',
+      trigGroups: { food: 'Еда и напитки', med: 'Лекарства, добавки и курсы', env: 'Атмосферное давление, погода и луна', sleep: 'Сон', cond: 'Периоды болезни' }, noTriggers: 'Пока ничего не выделяется.',
+      labs: 'Результаты анализов (введены пациенткой с бланка; используются только референсные диапазоны лаборатории, без «оптимальных»)'
     }
   };
   function tpl(str, vars) { return str.replace(/\{(\w+)\}/g, (m, k) => vars[k] != null ? vars[k] : m); }
@@ -437,59 +571,153 @@
   function trFactor(f, L) {
     if (L.factors[f]) return L.factors[f];
     const kind = f.slice(0, f.indexOf(':')), v = f.slice(f.indexOf(':') + 1);
-    if (kind === 'course') { const r = records.find(x => x.id === v); return tpl(L.factors.course, { x: r ? r.name : '?' }); }
+    if (kind === 'course' || kind === 'cond') { const r = records.find(x => x.id === v); return tpl(L.factors[kind], { x: r ? r.name : '?' }); }
     return tpl(L.factors[kind] || '{x}', { x: v });
   }
-  function buildDoctorSummary(lang) {
-    const L = I18N[lang] || I18N.en;
-    const days = loggedDays();
-    const out = [L.title, ''];
-    out.push(tpl(L.generated, { date: todayKey(), from: days[0] || '—', to: days[days.length - 1] || '—', n: days.length }), '');
-    // cycle
-    const cs = cycleStats();
-    out.push('## ' + L.cycle);
-    if (cs.starts.length) out.push(tpl(L.cycleLine, { dates: cs.starts.slice(-6).join(', '), cl: cs.cycleLength, k: cs.sampled, pl: cs.periodLength }));
-    else out.push(L.noCycle);
-    out.push('');
-    // symptoms and pain over last 90 logged days
-    const recent = days.slice(-90);
-    const sc = {}, pc = {}, mc = {};
+  // symptom, pain and medicine counts over the last 90 logged days
+  function recentCounts() {
+    const recent = loggedDays().slice(-90);
+    const sc = {}, pc = {}, mc = {}, fc = {};
+    let sleepN = 0, sleepSum = 0, sleepShort = 0;
     for (const k of recent) {
       const e = entries[k];
       for (const x of e.symptoms) sc[x] = (sc[x] || 0) + 1;
       for (const p of e.pains) { const o = pc[p.area] = pc[p.area] || { n: 0, sum: 0 }; o.n++; o.sum += p.level; }
       for (const x of e.meds) mc[x] = (mc[x] || 0) + 1;
+      for (const x of e.foods) fc[x] = (fc[x] || 0) + 1;
+      if (e.sleep != null) { sleepN++; sleepSum += e.sleep; if (e.sleep < 6) sleepShort++; }
     }
+    return { recent, sc, pc, mc, fc, sleepN, sleepAvg: sleepN ? Math.round(sleepSum / sleepN * 10) / 10 : null, sleepShort };
+  }
+  function symLine(x, n, N, L) { return '- ' + tpl(L.symLine, { sym: trSym(x, L), hits: n, n: N, pct: Math.round(n / N * 100) }); }
+  function painLine(a, o, L) { return '- ' + tpl(L.painLine, { area: trArea(a, L), hits: o.n, avg: Math.round(o.sum / o.n * 10) / 10 }); }
+  function testLine(r, L) {
+    let line = tpl(L.testLine, { date: r.date, name: r.name, value: r.value || '', unit: r.unit || '' }).replace(/\s+$/, '');
+    if (r.low || r.high) line += ' (' + tpl(L.range, { low: r.low ?? '…', high: r.high ?? '…' }) + ')';
+    const v = Number(r.value);
+    if (r.value && !isNaN(v)) { if (r.low && v < Number(r.low)) line += ' — ' + L.below; else if (r.high && v > Number(r.high)) line += ' — ' + L.above; }
+    if (r.notes) line += ` (${r.notes})`;
+    return '- ' + line;
+  }
+  function findingLine(f, L) { return '- ' + tpl(f.more ? L.more : L.less, { sym: trSym(f.symptom, L), label: trFactor(f.factor, L), hitsW: f.hitsW, nW: f.nW, hitsO: f.hitsO, nO: f.nO }); }
+  function summaryHead(L, title) {
+    const days = loggedDays();
+    return [title, '', tpl(L.generated, { date: todayKey(), from: days[0] || '—', to: days[days.length - 1] || '—', n: days.length }), ''];
+  }
+  function cycleLines(L) {
+    const cs = cycleStats();
+    return cs.starts.length ? tpl(L.cycleLine, { dates: cs.starts.slice(-6).join(', '), cl: cs.cycleLength, k: cs.sampled, pl: cs.periodLength }) : L.noCycle;
+  }
+  function buildDoctorSummary(lang, style) {
+    if (style === 'fm') return buildFunctionalSummary(lang);
+    const L = I18N[lang] || I18N.en;
+    const out = summaryHead(L, L.title);
+    out.push('## ' + L.cycle, cycleLines(L), '');
+    const { recent, sc, pc, mc } = recentCounts();
     out.push('## ' + L.symptoms);
-    const symLines = Object.entries(sc).sort((a, b) => b[1] - a[1]).map(([x, n]) => '- ' + tpl(L.symLine, { sym: trSym(x, L), hits: n, n: recent.length, pct: Math.round(n / recent.length * 100) }));
-    const painLines = Object.entries(pc).sort((a, b) => b[1].n - a[1].n).map(([a, o]) => '- ' + tpl(L.painLine, { area: trArea(a, L), hits: o.n, avg: Math.round(o.sum / o.n * 10) / 10 }));
+    const symLines = Object.entries(sc).sort((a, b) => b[1] - a[1]).map(([x, n]) => symLine(x, n, recent.length, L));
+    const painLines = Object.entries(pc).sort((a, b) => b[1].n - a[1].n).map(([a, o]) => painLine(a, o, L));
     out.push(...(symLines.length || painLines.length ? [...symLines, ...painLines] : [L.none]), '');
     out.push('## ' + L.meds);
     const medLines = Object.entries(mc).sort((a, b) => b[1] - a[1]).map(([x, n]) => '- ' + tpl(L.medLine, { name: x, n }));
     out.push(...(medLines.length ? medLines : [L.none]), '');
     // records
     const courses = records.filter(r => r.type === 'course'), tests = records.filter(r => r.type === 'test'), notes = records.filter(r => r.type === 'note');
+    const conds = records.filter(r => r.type === 'condition').sort((a, b) => a.start.localeCompare(b.start));
+    if (conds.length) { out.push('## ' + L.conditions); for (const r of conds) out.push('- ' + tpl(r.end ? L.condLine : L.condOngoing, { name: r.name, start: r.start, end: r.end }) + (r.notes ? ` (${r.notes})` : '')); out.push(''); }
     if (courses.length) { out.push('## ' + L.courses); for (const r of courses) out.push('- ' + tpl(r.end ? L.courseLine : L.courseOngoing, { name: r.name, start: r.start, end: r.end }) + (r.notes ? ` (${r.notes})` : '')); out.push(''); }
-    if (tests.length) {
-      out.push('## ' + L.tests);
-      for (const r of tests) {
-        let line = tpl(L.testLine, { date: r.date, name: r.name, value: r.value || '', unit: r.unit || '' }).replace(/\s+$/, '');
-        if (r.low || r.high) line += ' (' + tpl(L.range, { low: r.low ?? '…', high: r.high ?? '…' }) + ')';
-        const v = Number(r.value);
-        if (r.value && !isNaN(v)) { if (r.low && v < Number(r.low)) line += ' — ' + L.below; else if (r.high && v > Number(r.high)) line += ' — ' + L.above; }
-        if (r.notes) line += ` (${r.notes})`;
-        out.push('- ' + line);
-      }
-      out.push('');
-    }
+    if (tests.length) { out.push('## ' + L.tests); for (const r of tests) out.push(testLine(r, L)); out.push(''); }
     if (notes.length) { out.push('## ' + L.notes); for (const r of notes) out.push(`- ${r.date}: ${r.name}${r.notes ? '. ' + r.notes : ''}`); out.push(''); }
     // patterns
     out.push('## ' + L.patterns);
     const rep = patternReport();
     if (rep.days < MIN_PATTERN_DAYS) out.push(L.noPatterns);
     else if (!rep.findings.length) out.push('—');
-    else for (const f of rep.findings) out.push('- ' + tpl(f.more ? L.more : L.less, { sym: trSym(f.symptom, L), label: trFactor(f.factor, L), hitsW: f.hitsW, nW: f.nW, hitsO: f.hitsO, nO: f.nO }));
+    else for (const f of rep.findings) out.push(findingLine(f, L));
     out.push('', L.footer);
+    return out.join('\n');
+  }
+
+  // Functional medicine format: same data, arranged the way an FM practitioner reads a case.
+  // Timeline (antecedents, triggers, events), symptoms by body system (after the IFM matrix nodes),
+  // hormonal rhythm, modifiable lifestyle factors, possible triggers and mediators, labs.
+  // The grouping is by symptom name only and is approximate; her custom words land in "Other".
+  const FM_NODES = {
+    assim: { syms: ['Nausea', 'Bloating', 'Constipation', 'Diarrhoea'], areas: ['Belly'] },
+    energy: { syms: ['Fatigue', 'Brain fog', 'Poor sleep', 'Dizziness'], areas: [] },
+    comm: { syms: ['Low mood', 'Anxious', 'Irritable', 'Hot flush', 'Sore breasts', 'Cramps', 'Acne'], areas: ['Pelvis'] },
+    defense: { syms: ['Rash', 'Itching', 'Swelling'], areas: [] },
+    structure: { syms: ['Headache', 'Migraine'], areas: ['Head', 'Neck', 'Shoulders', 'Back', 'Joints', 'Legs', 'Chest', 'Other'] }
+  };
+  function factorGroup(f) {
+    if (['menses', 'premens', 'ovul'].includes(f)) return 'cycle';
+    if (['pdrop', 'prise', 'pswing', 'plow', 'fullmoon', 'newmoon'].includes(f)) return 'env';
+    if (f === 'shortsleep') return 'sleep';
+    const kind = f.slice(0, f.indexOf(':'));
+    return kind === 'food' ? 'food' : kind === 'cond' ? 'cond' : 'med';
+  }
+  function buildFunctionalSummary(lang) {
+    const L = I18N[lang] || I18N.en;
+    const out = summaryHead(L, L.fmTitle);
+    out.push(L.fmIntro, '');
+    // timeline
+    out.push('## ' + L.timeline);
+    const tl = [];
+    for (const r of records) {
+      const note = r.notes ? ` (${r.notes})` : '';
+      if (r.type === 'condition') tl.push([r.start, tpl(r.end ? L.tlCondEnded : L.tlCond, { start: r.start, name: r.name, end: r.end }) + note]);
+      else if (r.type === 'course') tl.push([r.start, tpl(r.end ? L.tlCourse : L.tlCourseStart, { start: r.start, name: r.name, end: r.end }) + note]);
+      else if (r.type === 'test') tl.push([r.date, tpl(L.tlTest, { date: r.date, name: r.name, value: r.value || '', unit: r.unit || '' }).replace(/\s+$/, '')]);
+      else tl.push([r.date, tpl(L.tlNote, { date: r.date, name: r.name }) + (r.notes ? '. ' + r.notes : '')]);
+    }
+    tl.sort((a, b) => a[0].localeCompare(b[0]));
+    out.push(...(tl.length ? tl.map(x => '- ' + x[1]) : [L.noRecords]), '');
+    // symptoms by body system
+    const { recent, sc, pc, mc, fc, sleepN, sleepAvg, sleepShort } = recentCounts();
+    out.push('## ' + L.systems);
+    const used = new Set();
+    let any = false;
+    for (const node in FM_NODES) {
+      const lines = [];
+      for (const x of FM_NODES[node].syms) if (sc[x]) { lines.push(symLine(x, sc[x], recent.length, L)); used.add('s:' + x); }
+      for (const a of FM_NODES[node].areas) if (pc[a]) { lines.push(painLine(a, pc[a], L)); used.add('p:' + a); }
+      if (lines.length) { any = true; out.push(L.nodes[node] + ':', ...lines); }
+    }
+    const other = [];
+    for (const x in sc) if (!used.has('s:' + x)) other.push(symLine(x, sc[x], recent.length, L));
+    for (const a in pc) if (!used.has('p:' + a)) other.push(painLine(a, pc[a], L));
+    if (other.length) { any = true; out.push(L.nodes.other + ':', ...other); }
+    if (!any) out.push(L.none);
+    out.push('');
+    // hormonal rhythm
+    const rep = patternReport();
+    const groups = { cycle: [], env: [], sleep: [], food: [], med: [], cond: [] };
+    for (const f of rep.findings) groups[factorGroup(f.factor)].push(f);
+    out.push('## ' + L.hormonal, cycleLines(L));
+    if (groups.cycle.length) for (const f of groups.cycle) out.push(findingLine(f, L)); else out.push(rep.days < MIN_PATTERN_DAYS ? L.noPatterns : L.noCycleFindings);
+    out.push('');
+    // lifestyle
+    out.push('## ' + L.lifestyle);
+    out.push('- ' + (sleepN ? tpl(L.sleepLine, { avg: sleepAvg, n: sleepN, short: sleepShort }) : L.sleepNone));
+    const top = (c, n) => Object.entries(c).sort((a, b) => b[1] - a[1]).slice(0, n).map(([name, k]) => tpl(L.countItem, { name, n: k })).join(', ');
+    out.push('- ' + (Object.keys(fc).length ? tpl(L.foodsLine, { list: top(fc, 12) }) : L.foodsNone));
+    if (Object.keys(mc).length) out.push('- ' + tpl(L.medsFm, { list: top(mc, 12) }));
+    const courses = records.filter(r => r.type === 'course');
+    for (const r of courses) out.push('- ' + tpl(r.end ? L.courseLine : L.courseOngoing, { name: r.name, start: r.start, end: r.end }) + (r.notes ? ` (${r.notes})` : ''));
+    out.push('');
+    // triggers and mediators
+    out.push('## ' + L.triggers);
+    if (rep.days < MIN_PATTERN_DAYS) out.push(L.noPatterns);
+    else {
+      let anyT = false;
+      for (const g of ['food', 'med', 'env', 'sleep', 'cond']) if (groups[g].length) { anyT = true; out.push(L.trigGroups[g] + ':', ...groups[g].map(f => findingLine(f, L))); }
+      if (!anyT) out.push(L.noTriggers);
+    }
+    out.push('');
+    // labs
+    const tests = records.filter(r => r.type === 'test');
+    if (tests.length) { out.push('## ' + L.labs); for (const r of tests) out.push(testLine(r, L)); out.push(''); }
+    out.push(L.footer);
     return out.join('\n');
   }
   async function copyText(text) {
@@ -564,14 +792,23 @@
 
   // ---------- render: shell ----------
   const view = document.getElementById('view');
+  // Every tap re-renders the whole view. Only a real move (other tab, other day) scrolls to the top;
+  // otherwise the scroll position and, when asked, the focused text field are put back so the page does not jump.
+  let lastView = '';
+  let refocus = null; // data-focus value of an input to focus again after the next render
   function render() {
+    const viewKey = tab + '|' + (tab === 'log' ? currentDate : '');
+    const moved = viewKey !== lastView;
+    const y = window.scrollY;
+    lastView = viewKey;
     document.getElementById('dateLabel').textContent = fmtDate(currentDate);
     document.getElementById('datePicker').value = currentDate;
     document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
     view.innerHTML = '';
     ({ log: renderLog, calendar: renderCalendar, patterns: renderPatterns, history: renderHistory, settings: renderSettings })[tab]();
     view.appendChild(el(`<p class="disclaimer">Doily keeps notes, it does not give medical advice. Talk to a doctor about anything that worries you.</p>`));
-    window.scrollTo(0, 0);
+    if (moved) window.scrollTo(0, 0); else window.scrollTo(0, y);
+    if (refocus) { const f = view.querySelector(`[data-focus="${refocus}"]`); refocus = null; if (f) f.focus({ preventScroll: true }); }
   }
 
   // ---------- render: log ----------
@@ -724,7 +961,7 @@
   function listCard(title, field, e, color, placeholder) {
     const card = fold(field, title, '', e[field].length ? e[field].join(', ') : 'none');
     card.body.appendChild(el(`<div><div class="chips current"></div>
-      <div class="inline-input"><input type="text" placeholder="${esc(placeholder)}" autocomplete="off" enterkeyhint="done">
+      <div class="inline-input"><input type="text" data-focus="${field}" placeholder="${esc(placeholder)}" autocomplete="off" enterkeyhint="done">
       ${speechSupported() ? '<button class="btn mic" aria-label="Dictate">🎤</button>' : ''}<button class="btn">Add</button></div>
       <div class="chips recent" style="margin-top:10px"></div></div>`));
     const cur = card.querySelector('.current');
@@ -741,7 +978,7 @@
     }
     if (!e[field].length) cur.appendChild(el(`<span class="muted small">Nothing yet</span>`));
     card.querySelector('.btn:not(.mic)').onclick = () => { if (input.value.trim()) addItems(input.value); };
-    input.onkeydown = ev => { if (ev.key === 'Enter') { ev.preventDefault(); if (input.value.trim()) addItems(input.value); } };
+    input.onkeydown = ev => { if (ev.key === 'Enter') { ev.preventDefault(); if (input.value.trim()) { refocus = field; addItems(input.value); } } }; // keyboard stays up for the next item
     const mic = card.querySelector('.mic');
     if (mic) mic.onclick = () => listen(addItems, mic);
     const rec = card.querySelector('.recent');
@@ -866,31 +1103,39 @@
 
     // for your doctor
     const doc = el(`<section class="card"><h2>For your doctor</h2>
-      <p class="muted small" style="margin:0 0 10px">A plain-text summary of the last 90 days, your records and the patterns above. No name, no location. Pick the language the specialist reads.</p>
+      <p class="muted small" style="margin:0 0 10px">A plain-text summary of the last 90 days, your records and the patterns above. No name, no location. Pick the language the specialist reads and how they like to see it.</p>
       <div class="chips lang"></div>
+      <div class="chips style" style="margin-top:8px"></div>
+      <p class="muted small" id="styleHint" style="margin:8px 0 0"></p>
       <div class="row" style="margin-top:12px"><button class="btn" id="docCopy">📋 Copy summary</button>${navigator.share ? '<button class="btn secondary" id="docShare">↗ Share</button>' : ''}</div></section>`);
     const lc = doc.querySelector('.lang');
     for (const [code, name] of LANGS) { const c = el(`<button class="chip sage ${settings.docLang === code ? 'on' : ''}">${name}</button>`); c.onclick = () => { settings.docLang = code; saveSettings(); render(); }; lc.appendChild(c); }
+    const stc = doc.querySelector('.style');
+    for (const [code, name] of [['conv', '🩺 Conventional'], ['fm', '🌿 Functional medicine']]) { const c = el(`<button class="chip honey ${settings.docStyle === code ? 'on' : ''}">${name}</button>`); c.onclick = () => { settings.docStyle = code; saveSettings(); render(); }; stc.appendChild(c); }
+    doc.querySelector('#styleHint').textContent = settings.docStyle === 'fm'
+      ? 'Same facts, arranged as a functional medicine practitioner reads a case: timeline, symptoms by body system, hormonal rhythm, lifestyle factors, possible triggers. Grouping is approximate.'
+      : 'Cycle, symptom and medicine frequency, records, then the patterns. The usual order for a GP or specialist.';
+    const summary = () => buildDoctorSummary(settings.docLang, settings.docStyle);
     const preview = fold('docPreview', 'Preview', '', ''); preview.classList.add('inner');
-    preview.body.appendChild(el(`<pre class="doc-preview">${esc(buildDoctorSummary(settings.docLang))}</pre>`));
+    preview.body.appendChild(el(`<pre class="doc-preview">${esc(summary())}</pre>`));
     preview.querySelector('.fold-sum').remove();
     doc.appendChild(preview);
-    doc.querySelector('#docCopy').onclick = async () => { toast(await copyText(buildDoctorSummary(settings.docLang)) ? 'Copied. Paste it into a message or note.' : 'Could not copy on this browser'); };
+    doc.querySelector('#docCopy').onclick = async () => { toast(await copyText(summary()) ? 'Copied. Paste it into a message or note.' : 'Could not copy on this browser'); };
     const sh = doc.querySelector('#docShare');
-    if (sh) sh.onclick = () => navigator.share({ title: 'Doily summary', text: buildDoctorSummary(settings.docLang) }).catch(() => { });
+    if (sh) sh.onclick = () => navigator.share({ title: 'Doily summary', text: summary() }).catch(() => { });
     view.appendChild(doc);
 
     // records card
-    const recCard = fold('records', 'Medical records', 'tests, courses, notes', records.length ? `${records.length} record${records.length === 1 ? '' : 's'}` : 'none');
+    const recCard = fold('records', 'Medical records', 'tests, courses, illnesses, notes', records.length ? `${records.length} record${records.length === 1 ? '' : 's'}` : 'none');
     const body = recCard.body;
-    const types = [['test', '🧪 Test result'], ['course', '💊 Medicine or supplement course'], ['note', '📝 Note']];
+    const types = [['test', '🧪 Test result'], ['course', '💊 Medicine or supplement course'], ['condition', '🩺 Illness or diagnosis'], ['note', '📝 Note']];
     const tc = body.appendChild(el(`<div class="chips" style="margin-bottom:10px"></div>`));
     for (const [v, label] of types) { const c = el(`<button class="chip sage ${recType === v ? 'on' : ''}">${label}</button>`); c.onclick = () => { recType = v; render(); }; tc.appendChild(c); }
     const t = todayKey();
     let form;
     if (recType === 'test') form = el(`<div class="rec-form">
       <div class="field"><label>What was tested</label><input type="text" id="rName" placeholder="e.g. Ferritin, Vitamin D, TSH" autocomplete="off"></div>
-      <div class="row"><div class="field" style="flex:1"><label>Date</label><input type="date" id="rDate" value="${t}" max="${t}"></div>
+      <div class="row"><div class="field" style="flex:1"><label>Date</label><input type="date" id="rDate" value="${scan.date || t}" max="${t}"></div>
       <div class="field" style="flex:1"><label>Result</label><input type="text" id="rValue" inputmode="decimal" placeholder="e.g. 12"></div>
       <div class="field" style="flex:1"><label>Unit</label><input type="text" id="rUnit" placeholder="µg/L"></div></div>
       <div class="row"><div class="field" style="flex:1"><label>Range low (from the sheet)</label><input type="text" id="rLow" inputmode="decimal" placeholder="optional"></div>
@@ -901,10 +1146,16 @@
       <div class="row"><div class="field" style="flex:1"><label>Started</label><input type="date" id="rStart" value="${t}"></div>
       <div class="field" style="flex:1"><label>Stopped</label><input type="date" id="rEnd"><span class="muted small">blank = still taking</span></div></div>
       <div class="field"><label>Notes</label><input type="text" id="rNotes" placeholder="optional, e.g. prescribed for…"></div></div>`);
+    else if (recType === 'condition') form = el(`<div class="rec-form">
+      <div class="field"><label>Illness, diagnosis, allergy or operation</label><input type="text" id="rName" placeholder="e.g. Hypothyroidism, appendix removed, hay fever" autocomplete="off"></div>
+      <div class="row"><div class="field" style="flex:1"><label>Since (year is enough)</label><input type="text" id="rStart" inputmode="numeric" placeholder="e.g. 2019 or 2021-03"></div>
+      <div class="field" style="flex:1"><label>Until</label><input type="text" id="rEnd" inputmode="numeric" placeholder="blank = ongoing"></div></div>
+      <div class="field"><label>Notes</label><input type="text" id="rNotes" placeholder="optional, e.g. who diagnosed it, treatment"></div></div>`);
     else form = el(`<div class="rec-form">
       <div class="field"><label>Title</label><input type="text" id="rName" placeholder="e.g. Doctor visit, diagnosis, scan" autocomplete="off"></div>
       <div class="field"><label>Date</label><input type="date" id="rDate" value="${t}"></div>
       <div class="field"><label>Notes</label><input type="text" id="rNotes" placeholder="what was said or found"></div></div>`);
+    if (recType === 'test') form.prepend(scanBlock(form));
     body.appendChild(form);
     const addBtn = body.appendChild(el(`<button class="btn" style="width:100%">Add record</button>`));
     addBtn.onclick = () => {
@@ -912,6 +1163,11 @@
       const name = g('rName'); if (!name) { toast('Give it a name first'); return; }
       const r = { id: Date.now().toString(36), type: recType, name: cap(name), notes: g('rNotes') };
       if (recType === 'course') { r.start = g('rStart') || t; r.end = g('rEnd') || null; if (r.end && r.end < r.start) { toast('Stopped date is before the start'); return; } }
+      else if (recType === 'condition') {
+        r.start = g('rStart') ? normWhen(g('rStart')) : t; r.end = g('rEnd') ? normWhen(g('rEnd')) : null;
+        if (!r.start || (g('rEnd') && !r.end)) { toast('Dates like 2019, 2021-03 or 2021-03-15'); return; }
+        if (r.end && r.end < r.start) { toast('Until is before since'); return; }
+      }
       else { r.date = g('rDate') || t; }
       if (recType === 'test') { r.value = g('rValue'); r.unit = g('rUnit'); r.low = g('rLow') || null; r.high = g('rHigh') || null; }
       records.push(r); saveRecords(); render(); toast('Record added');
@@ -919,14 +1175,15 @@
     if (records.length) {
       const list = body.appendChild(el(`<div class="rec-list"></div>`));
       for (const r of records) {
-        const ico = { test: '🧪', course: '💊', note: '📝' }[r.type];
+        const ico = { test: '🧪', course: '💊', condition: '🩺', note: '📝' }[r.type];
         let detail = '';
         if (r.type === 'test') detail = `${fmtShort(r.date)}${r.value ? ' · ' + esc(r.value) + ' ' + esc(r.unit || '') : ''}${r.low || r.high ? ' · range ' + esc(r.low ?? '…') + '–' + esc(r.high ?? '…') : ''}`;
         else if (r.type === 'course') detail = `${fmtShort(r.start)} → ${r.end ? fmtShort(r.end) : 'still taking'}`;
+        else if (r.type === 'condition') detail = `${fmtWhen(r.start)} → ${r.end ? fmtWhen(r.end) : 'ongoing'}`;
         else detail = fmtShort(r.date);
         const row = el(`<div class="rec-item"><div class="rec-main"><div class="rec-name">${ico} ${esc(r.name)}</div><div class="muted small">${detail}</div>${r.notes ? `<div class="muted small">${esc(r.notes)}</div>` : ''}</div><div class="rec-actions"></div></div>`);
         const act = row.querySelector('.rec-actions');
-        if (r.type === 'course' && !r.end) { const stop = el(`<button class="btn secondary small">Stopped today</button>`); stop.onclick = () => { r.end = t; saveRecords(); render(); }; act.appendChild(stop); }
+        if ((r.type === 'course' || r.type === 'condition') && !r.end) { const stop = el(`<button class="btn secondary small">${r.type === 'course' ? 'Stopped' : 'Over'} today</button>`); stop.onclick = () => { r.end = t; saveRecords(); render(); }; act.appendChild(stop); }
         const del = el(`<button class="icon-btn small" aria-label="Delete record">×</button>`);
         del.onclick = () => { if (confirm(`Delete "${r.name}"?`)) { records = records.filter(x => x.id !== r.id); saveRecords(); render(); } };
         act.appendChild(del);
@@ -935,6 +1192,75 @@
     }
     body.appendChild(el(`<p class="muted small" style="margin:10px 0 0">Records stay on this phone like everything else and are included in backups.</p>`));
     view.appendChild(recCard);
+  }
+
+  // The "read it for me" block at the top of the test form: photo or pasted text in, editable rows out.
+  function scanBlock(form) {
+    const b = el(`<div class="scan">
+      <div class="row"><label class="btn secondary small">📷 Scan a photo<input type="file" accept="image/*" class="visually-hidden"></label>
+      <button class="btn secondary small" id="pasteBtn">📋 Paste text</button></div>
+      <p class="muted small" style="margin:8px 0 0">Snap the result sheet or paste its text and Doily fills in the names, numbers and ranges for you to check. Reading happens on this phone; the photo is not uploaded.</p>
+      <div class="scan-status muted small" id="scanStatus"></div></div>`);
+    const setStatus = m => { scan.status = m; const n = document.getElementById('scanStatus'); if (n) n.textContent = m; };
+    b.querySelector('input[type=file]').onchange = async ev => {
+      const f = ev.target.files[0]; if (!f) return;
+      if (!navigator.onLine && !window.Tesseract) { toast('The reader needs internet the first time'); return; }
+      try {
+        const text = await ocrFile(f, setStatus);
+        const parsed = parseResultSheet(text);
+        scan = { rows: parsed.rows, date: parsed.date, raw: text, status: '', pasteOpen: false };
+        if (!parsed.rows.length) toast('Could not find results in that photo. Try closer, straighter, in good light.');
+        render();
+      } catch (err) { console.warn('ocr', err); setStatus(''); toast('Reading failed. Check the connection and try again.'); }
+    };
+    b.querySelector('#pasteBtn').onclick = () => { scan.pasteOpen = !scan.pasteOpen; render(); };
+    if (scan.pasteOpen) {
+      const pb = el(`<div style="margin-top:10px"><textarea id="pasteBox" placeholder="Paste the text of the result sheet here, one result per line"></textarea>
+        <button class="btn secondary small" style="margin-top:6px">Read the text</button></div>`);
+      pb.querySelector('button').onclick = () => {
+        const txt = pb.querySelector('textarea').value;
+        const parsed = parseResultSheet(txt);
+        scan = { rows: parsed.rows, date: parsed.date, raw: txt, status: '', pasteOpen: false };
+        if (!parsed.rows.length) toast('No results found in that text');
+        render();
+      };
+      b.appendChild(pb);
+    }
+    if (scan.status) b.querySelector('#scanStatus').textContent = scan.status;
+    if (scan.rows && scan.rows.length) {
+      const n = scan.rows.length;
+      const list = el(`<div class="scan-rows"><p class="muted small" style="margin:10px 0 6px">Found ${n} result${n === 1 ? '' : 's'}. Untick anything that is not a result, fix any misread number, then add. The date below applies to all of them.</p></div>`);
+      scan.rows.forEach((r, i) => {
+        const row = el(`<div class="scan-item"><label class="scan-check"><input type="checkbox" ${r.skip ? '' : 'checked'}></label>
+          <div class="scan-fields"><input type="text" value="${esc(r.name)}" placeholder="name" class="f-name">
+          <div class="row"><input type="text" value="${esc(r.value)}" placeholder="result" inputmode="decimal" class="f-num"><input type="text" value="${esc(r.unit || '')}" placeholder="unit" class="f-num">
+          <input type="text" value="${esc(r.low ?? '')}" placeholder="low" inputmode="decimal" class="f-num"><input type="text" value="${esc(r.high ?? '')}" placeholder="high" inputmode="decimal" class="f-num"></div></div></div>`);
+        row.querySelector('input[type=checkbox]').onchange = ev => { r.skip = !ev.target.checked; row.classList.toggle('off', r.skip); };
+        row.classList.toggle('off', !!r.skip);
+        const [fn, fv, fu, fl, fh] = row.querySelectorAll('input[type=text]');
+        fn.oninput = () => r.name = fn.value; fv.oninput = () => r.value = fv.value; fu.oninput = () => r.unit = fu.value; fl.oninput = () => r.low = fl.value; fh.oninput = () => r.high = fh.value;
+        list.appendChild(row);
+      });
+      const act = el(`<div class="row" style="margin-top:8px"><button class="btn small">Add the ticked results</button><button class="btn secondary small">Discard</button></div>`);
+      act.children[0].onclick = () => {
+        const date = (form.querySelector('#rDate') || {}).value || todayKey();
+        let added = 0;
+        for (const r of scan.rows) {
+          if (r.skip || !r.name.trim()) continue;
+          records.push({ id: Date.now().toString(36) + added, type: 'test', name: cap(r.name.trim()), date, value: String(r.value).trim(), unit: (r.unit || '').trim(), low: String(r.low ?? '').trim() || null, high: String(r.high ?? '').trim() || null, notes: 'read from the sheet by Doily' });
+          added++;
+        }
+        scan = { rows: null, date: null, raw: '', status: '', pasteOpen: false };
+        saveRecords(); render(); toast(added ? `${added} result${added === 1 ? '' : 's'} added` : 'Nothing ticked');
+      };
+      act.children[1].onclick = () => { scan = { rows: null, date: null, raw: '', status: '', pasteOpen: false }; render(); };
+      list.appendChild(act);
+      const rawFold = fold('scanRaw', 'What was read', '', ''); rawFold.classList.add('inner'); rawFold.querySelector('.fold-sum').remove();
+      rawFold.body.appendChild(el(`<pre class="doc-preview">${esc(scan.raw)}</pre>`));
+      list.appendChild(rawFold);
+      b.appendChild(list);
+    }
+    return b;
   }
 
   // ---------- render: settings ----------
@@ -1011,7 +1337,7 @@
     };
     view.appendChild(data);
 
-    const about = el(`<section class="card"><h2>About</h2><p class="muted small" style="margin:0">Doily v1. Moon phases are calculated on the device. Weather and town search use the free Open-Meteo service and are the only things that leave your phone.${speechSupported() ? '' : ' Voice input is not available in this browser.'}</p></section>`);
+    const about = el(`<section class="card"><h2>About</h2><p class="muted small" style="margin:0">Doily v1. Moon phases are calculated on the device. Weather and town search use the free Open-Meteo service. Scanning a result sheet reads the photo on the phone itself; the reader (Tesseract) and its Lithuanian and English language files are fetched once from the free jsDelivr CDN. Nothing you log ever leaves your phone.${speechSupported() ? '' : ' Voice input is not available in this browser.'}</p></section>`);
     view.appendChild(about);
   }
 

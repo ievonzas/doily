@@ -311,3 +311,16 @@ details.fold.inner::after { display: none; }
 details.fold.inner summary { padding: 8px 0; min-height: 40px; }
 details.fold.inner summary h2 { font-size: 15px; }
 details.fold.inner .fold-body { padding: 0; }
+
+/* ---- scanning a result sheet ---- */
+.scan { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1.5px dotted var(--line); }
+.scan .btn.secondary input { display: none; }
+.scan-status:not(:empty) { margin-top: 8px; padding: 8px 12px; border-radius: 12px; background: var(--leaf-mist); border: 1.5px dashed #b9cfa4; }
+.scan-item { display: flex; gap: 8px; align-items: flex-start; padding: 8px 0; border-top: 1.5px dotted var(--line); }
+.scan-item.off { opacity: 0.45; }
+.scan-check { display: grid; place-items: center; width: var(--tap); height: var(--tap); flex: none; }
+.scan-check input { width: 24px; height: 24px; accent-color: var(--leaf); }
+.scan-fields { flex: 1; min-width: 0; display: grid; gap: 6px; }
+.scan-fields input[type=text] { width: 100%; min-width: 0; border: 1.5px solid var(--line); border-radius: 12px; padding: 8px 10px; background: #fff; font-size: 15px; }
+.scan-fields .row { flex-wrap: nowrap; gap: 6px; }
+.scan-fields .f-num { flex: 1; }

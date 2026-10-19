@@ -10,13 +10,14 @@ Named after the little knitted decorations grandmas make.
 - **Context card**: moon phase and illumination, current air pressure with the 24 h change and the next 12 h trend, cycle day and days until the next period.
 - **Calendar**: period days, predicted periods, estimated fertile window and ovulation, plus dots for pain, symptoms and meds. Tap a day to open it.
 - **Patterns**: once 14 days are logged, plain sentences about what clusters with what in your own logs, such as "Headache more often when pressure fell 4 hPa or more: on 8 of 12 days, compared with 2 of 48 other days". Looks at air pressure, sleep, moon, cycle phase, and food or medicines from the last day. Correlation, not cause, and it says so.
-- **Medical records**: blood test results with the range from the sheet, medicine or supplement courses, and notes such as doctor visits. The report flags results outside their printed range and compares how you felt in the month before a test, or before and during a course.
+- **Medical records**: blood test results with the range from the sheet, medicine or supplement courses, illnesses and diagnoses (past or ongoing, a year is enough), and notes such as doctor visits. The report flags results outside their printed range and compares how you felt in the month before a test, or before and during a course.
+- **Scan a result sheet**: snap a photo of the lab printout, or paste its text, and Doily reads the names, numbers, units and ranges into editable rows for you to tick and add. Reading happens on the phone; the photo is never uploaded. The reader and its Lithuanian and English language files are fetched once from a free CDN, so the first scan needs internet.
 - **Might be felt today**: the day's weather, moon, cycle and last night's sleep turn into gentle notes about what people often feel on such days, followed by anything your own logs show for days like this.
-- **For your doctor**: one tap copies or shares a plain-text summary of the last 90 days, records and patterns, in Lithuanian, English or Russian. No name or location in it.
+- **For your doctor**: one tap copies or shares a plain-text summary of the last 90 days, records and patterns, in Lithuanian, English or Russian. No name or location in it. Two layouts: the conventional one (cycle, symptom and medicine frequency, records, patterns) and a functional medicine one (timeline, symptoms grouped by body system, hormonal rhythm, lifestyle factors, possible triggers, labs). Same facts either way, only the arrangement changes.
 - **History**: every logged day with its moon, pressure and cycle day, so patterns are easy to spot by eye.
 - **Settings**: location by GPS or town search, cycle defaults, export and import of a backup file, delete everything.
 
-Everything is stored in the browser on the device. The only network calls are to [Open-Meteo](https://open-meteo.com/) for weather and town search, which is free and needs no account.
+Everything is stored in the browser on the device. The only network calls are to [Open-Meteo](https://open-meteo.com/) for weather and town search, which is free and needs no account, and a one-time download of the [Tesseract.js](https://github.com/naptha/tesseract.js) reader from the jsDelivr CDN when you first scan a result sheet.
 
 ## Run it locally
 
@@ -57,7 +58,7 @@ Backups are plain JSON with `entries`, `settings` and `records`. Each day in `en
 }
 ```
 
-`records` is a list of test results (`name, date, value, unit, low, high`), courses (`name, start, end`) and notes (`name, date, notes`).
+`records` is a list of test results (`name, date, value, unit, low, high`), courses (`name, start, end`), conditions (`name, start, end`, where a date may be just a year or year-month) and notes (`name, date, notes`).
 
 ## Planned for version 2
 
